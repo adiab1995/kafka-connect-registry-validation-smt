@@ -16,7 +16,7 @@ For every record whose value is a `Struct`:
 2. Converts the value to JSON with `JsonSchemaData`, exactly as `JsonSchemaConverter` does.
 3. Validates it against the latest schema of `<topic>-value` (or the configured `subject`).
 4. **Valid** → forwarded on the same topic, without the raw field.
-   **Invalid** → sent to `<topic>.dlq` with this value:
+   **Invalid** → sent to the dead letter topic (`dlq.topic`, or `<topic>.dlq` by default) with this value:
 
 ```json
 {
@@ -32,8 +32,9 @@ All validation rules come from the registered schema: required fields, nested ob
 No field list has to be maintained in the connector configuration. Schemas are cached and refreshed every
 `schema.cache.ttl.ms`.
 
-Records already on a topic ending with the DLQ suffix are left untouched. Schema Registry errors fail the record
-(they are not routed to the DLQ).
+Records already on the dead letter topic are left untouched: the topic equal to `dlq.topic` when it is set, otherwise
+any topic ending with `dlq.topic.suffix`. This lets an upstream step (such as a FilePulse failure chain) write to the
+same dead letter topic. Schema Registry errors fail the record (they are not routed to the DLQ).
 
 ## Installation
 
@@ -41,7 +42,7 @@ The SMT relies on the classes of the Confluent JSON Schema converter. Copy the j
 `kafka-connect-json-schema-converter` plugin**, so both share the same plugin class loader:
 
 ```dockerfile
-ADD https://github.com/adiab1995/kafka-connect-registry-validation-smt/releases/download/v0.1.0/kafka-connect-registry-validation-smt-0.1.0.jar \
+ADD https://github.com/adiab1995/kafka-connect-registry-validation-smt/releases/download/v0.2.0/kafka-connect-registry-validation-smt-0.2.0.jar \
     /usr/share/confluent-hub-components/confluentinc-kafka-connect-json-schema-converter/lib/
 ```
 
@@ -55,7 +56,8 @@ Built and tested against Confluent Platform 7.9.2 (Apache Kafka 3.9), Java 17.
 | `basic.auth.user.info` | — | Schema Registry credentials `key:secret` |
 | `subject` | `<topic>-value` | Subject to validate against |
 | `raw.field` | `message` | Field holding the raw line: removed from valid records, kept in DLQ records |
-| `dlq.topic.suffix` | `.dlq` | Suffix of the dead letter topic |
+| `dlq.topic` | — | Dead letter topic. Overrides `dlq.topic.suffix` when set |
+| `dlq.topic.suffix` | `.dlq` | Suffix appended to the record topic when `dlq.topic` is not set |
 | `source` | — | Value of the `source` field in DLQ records |
 | `file.name.header` | `connect.file.name` | Header holding the source file name |
 | `line.number.header` | `connect.file.line.number` | Header holding the source line number |
@@ -71,11 +73,19 @@ Built and tested against Confluent Platform 7.9.2 (Apache Kafka 3.9), Java 17.
 "filters.ParseJSON.type": "io.streamthoughts.kafka.connect.filepulse.filter.JSONFilter",
 "filters.ParseJSON.source": "message",
 "filters.ParseJSON.merge": "true",
+"filters.ParseJSON.withOnFailure": "ToErrorTopic, AddError",
+"filters.ToErrorTopic.type": "io.streamthoughts.kafka.connect.filepulse.filter.AppendFilter",
+"filters.ToErrorTopic.field": "$topic",
+"filters.ToErrorTopic.value": "dev.orders.dlq",
+"filters.AddError.type": "io.streamthoughts.kafka.connect.filepulse.filter.AppendFilter",
+"filters.AddError.field": "$.error",
+"filters.AddError.value": "{{ $error.exceptionMessage }}",
 
 "transforms": "validate",
 "transforms.validate.type": "com.pluxee.connect.transforms.ValidateAgainstRegistry",
 "transforms.validate.schema.registry.url": "https://schema-registry:8081",
 "transforms.validate.basic.auth.user.info": "${file:/mnt/secrets/sr.properties:basic.auth.user.info}",
+"transforms.validate.dlq.topic": "dev.orders.dlq",
 "transforms.validate.source": "orders",
 
 "value.converter": "io.confluent.connect.json.JsonSchemaConverter",
@@ -83,6 +93,10 @@ Built and tested against Confluent Platform 7.9.2 (Apache Kafka 3.9), Java 17.
 "value.converter.use.latest.version": "true",
 "value.converter.json.fail.invalid.schema": "true"
 ```
+
+Invalid JSON lines are routed by FilePulse (`withOnFailure`), schema violations by the SMT. Use the same value for
+`filters.ToErrorTopic.value` and `transforms.validate.dlq.topic`, so both land on one dead letter topic and the SMT
+skips the records FilePulse already rerouted.
 
 Keep the raw field (do **not** exclude `message` in FilePulse): the SMT removes it from valid records and keeps it in
 DLQ records. The DLQ topic needs a registered schema matching the DLQ value above.
@@ -99,8 +113,8 @@ Push a tag `vX.Y.Z`: the release workflow sets the version from the tag, builds,
 GitHub release.
 
 ```shell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ## License

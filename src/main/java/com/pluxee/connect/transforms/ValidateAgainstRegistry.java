@@ -45,6 +45,7 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
     public static final String BASIC_AUTH_USER_INFO = "basic.auth.user.info";
     public static final String SUBJECT = "subject";
     public static final String RAW_FIELD = "raw.field";
+    public static final String DLQ_TOPIC = "dlq.topic";
     public static final String DLQ_TOPIC_SUFFIX = "dlq.topic.suffix";
     public static final String SOURCE = "source";
     public static final String FILE_NAME_HEADER = "file.name.header";
@@ -60,8 +61,12 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
                 ConfigDef.Importance.MEDIUM, "Subject to validate against. Defaults to '<topic>-value'.")
         .define(RAW_FIELD, ConfigDef.Type.STRING, "message",
                 ConfigDef.Importance.MEDIUM, "Field holding the raw line. Removed from valid records, kept in DLQ records.")
+        .define(DLQ_TOPIC, ConfigDef.Type.STRING, null,
+                ConfigDef.Importance.MEDIUM, "Topic of invalid records. Records already on this topic are left untouched. "
+                                             + "Overrides '" + DLQ_TOPIC_SUFFIX + "' when set.")
         .define(DLQ_TOPIC_SUFFIX, ConfigDef.Type.STRING, ".dlq",
-                ConfigDef.Importance.MEDIUM, "Suffix appended to the topic of invalid records.")
+                ConfigDef.Importance.MEDIUM, "Suffix appended to the topic of invalid records when '" + DLQ_TOPIC
+                                             + "' is not set. Records on topics ending with it are left untouched.")
         .define(SOURCE, ConfigDef.Type.STRING, null,
                 ConfigDef.Importance.LOW, "Value of the 'source' field of DLQ records.")
         .define(FILE_NAME_HEADER, ConfigDef.Type.STRING, "connect.file.name",
@@ -85,6 +90,7 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
     private JsonSchemaData jsonSchemaData;
     private String subject;
     private String rawField;
+    private String dlqTopic;
     private String dlqSuffix;
     private String source;
     private String fileNameHeader;
@@ -107,6 +113,7 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
         AbstractConfig config = new AbstractConfig(CONFIG_DEF, props);
         subject = config.getString(SUBJECT);
         rawField = config.getString(RAW_FIELD);
+        dlqTopic = config.getString(DLQ_TOPIC);
         dlqSuffix = config.getString(DLQ_TOPIC_SUFFIX);
         source = config.getString(SOURCE);
         fileNameHeader = config.getString(FILE_NAME_HEADER);
@@ -128,7 +135,7 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
 
     @Override
     public R apply(R record) {
-        if (!(record.value() instanceof Struct value) || record.topic().endsWith(dlqSuffix)) {
+        if (!(record.value() instanceof Struct value) || isDlqTopic(record.topic())) {
             return record;
         }
 
@@ -152,6 +159,14 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
         LOG.debug("Record from {} line {} rerouted to DLQ: {}",
                   headerValue(record, fileNameHeader), headerValue(record, lineNumberHeader), error);
         return toDlq(record, raw != null ? raw : String.valueOf(payload), error);
+    }
+
+    private boolean isDlqTopic(String topic) {
+        return dlqTopic != null ? topic.equals(dlqTopic) : topic.endsWith(dlqSuffix);
+    }
+
+    private String dlqTopicFor(String topic) {
+        return dlqTopic != null ? dlqTopic : topic + dlqSuffix;
     }
 
     private JsonSchema schemaFor(String topic) {
@@ -206,7 +221,7 @@ public class ValidateAgainstRegistry<R extends ConnectRecord<R>> implements Tran
             .put("source", source)
             .put("fileName", headerValue(record, fileNameHeader))
             .put("lineNumber", lineNumber(record));
-        return record.newRecord(record.topic() + dlqSuffix, null, record.keySchema(), record.key(),
+        return record.newRecord(dlqTopicFor(record.topic()), null, record.keySchema(), record.key(),
                                 DLQ_SCHEMA, dlq, record.timestamp(), record.headers());
     }
 

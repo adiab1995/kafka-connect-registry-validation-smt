@@ -123,10 +123,37 @@ class ValidateAgainstRegistryTest {
     }
 
     @Test
+    void explicitDlqTopicReceivesInvalidRecords() {
+        ValidateAgainstRegistry<SourceRecord> explicit = withDlqTopic("dev.errors");
+
+        SourceRecord result = explicit.apply(record(TOPIC, order("A1", "002", null, ITEM)));
+
+        assertEquals("dev.errors", result.topic());
+        assertEquals(ValidateAgainstRegistry.DLQ_SCHEMA, result.valueSchema());
+        assertEquals(TOPIC, explicit.apply(record(TOPIC, order("A1", "02", null, ITEM))).topic());
+    }
+
+    @Test
+    void recordsAlreadyOnExplicitDlqTopicAreUntouched() {
+        ValidateAgainstRegistry<SourceRecord> explicit = withDlqTopic("dev.errors");
+        SourceRecord record = record("dev.errors", order("A1", "002", null, ITEM));
+
+        assertSame(record, explicit.apply(record));
+    }
+
+    @Test
     void registryErrorFailsTheRecordInsteadOfRoutingToDlq() {
         SourceRecord record = record("unknown.topic", order("A1", "02", null, ITEM));
 
         assertThrows(ConnectException.class, () -> transform.apply(record));
+    }
+
+    private ValidateAgainstRegistry<SourceRecord> withDlqTopic(String dlqTopic) {
+        ValidateAgainstRegistry<SourceRecord> explicit = new ValidateAgainstRegistry<>(registry);
+        explicit.configure(Map.of(
+            ValidateAgainstRegistry.SCHEMA_REGISTRY_URL, "mock://unused",
+            ValidateAgainstRegistry.DLQ_TOPIC, dlqTopic));
+        return explicit;
     }
 
     private static Struct assertDlq(SourceRecord result) {
