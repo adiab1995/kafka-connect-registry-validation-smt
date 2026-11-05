@@ -142,6 +142,94 @@ class ValidateAgainstRegistryTest {
     }
 
     @Test
+    void envelopeDlqRecordCarriesErrorHeaders() {
+        SourceRecord result = transform.apply(record(TOPIC, order("A1", "002", null, ITEM)));
+
+        assertTrue(header(result, "dlq.error.message").contains("productCode"));
+        assertEquals(TOPIC + "-value", header(result, "dlq.error.subject"));
+        assertEquals(TOPIC, header(result, "dlq.original.topic"));
+        assertEquals("42", header(result, "connect.file.line.number"));
+    }
+
+    @Test
+    void originalModeKeepsRejectedValueAndPutsErrorInHeaders() {
+        ValidateAgainstRegistry<SourceRecord> original = configured(Map.of(
+            ValidateAgainstRegistry.DLQ_TOPIC, "dev.errors",
+            ValidateAgainstRegistry.DLQ_VALUE_MODE, "original"));
+        Struct value = order("A1", "002", null, ITEM);
+
+        SourceRecord result = original.apply(record(TOPIC, value));
+
+        assertEquals("dev.errors", result.topic());
+        assertSame(value, result.value());
+        assertEquals(value.schema(), result.valueSchema());
+        assertTrue(header(result, "dlq.error.message").contains("productCode"));
+        assertEquals(TOPIC, header(result, "dlq.original.topic"));
+    }
+
+    @Test
+    void errorHeadersDoNotLeakIntoTheIncomingRecord() {
+        SourceRecord incoming = record(TOPIC, order("A1", "002", null, ITEM));
+
+        transform.apply(incoming);
+
+        assertNull(incoming.headers().lastWithName("dlq.error.message"));
+    }
+
+    @Test
+    void sourcePositionHeadersAreAddedToDlqRecords() {
+        ValidateAgainstRegistry<SourceRecord> withPosition = configured(Map.of(
+            ValidateAgainstRegistry.SOURCE_POSITION_HEADERS, "true"));
+        Struct value = order("A1", "002", null, ITEM);
+        SourceRecord record = new SourceRecord(Map.of("table", "orders"), Map.of("incrementing", 7L),
+                                               TOPIC, null, null, null, value.schema(), value);
+
+        SourceRecord result = withPosition.apply(record);
+
+        assertEquals("{\"table\":\"orders\"}", header(result, "connect.source.partition"));
+        assertEquals("{\"incrementing\":7}", header(result, "connect.source.offset"));
+    }
+
+    @Test
+    void envelopeWithoutRawFieldStoresRecordAsJson() {
+        ValidateAgainstRegistry<SourceRecord> noRaw = configured(Map.of(ValidateAgainstRegistry.RAW_FIELD, ""));
+        Schema schema = SchemaBuilder.struct()
+            .field("orderId", Schema.OPTIONAL_STRING_SCHEMA)
+            .field("productCode", Schema.OPTIONAL_STRING_SCHEMA)
+            .build();
+        Struct value = new Struct(schema).put("orderId", "A1").put("productCode", "002");
+
+        Struct dlq = assertDlq(noRaw.apply(record(TOPIC, value)));
+
+        assertEquals("{\"orderId\":\"A1\",\"productCode\":\"002\"}", dlq.getString("message"));
+    }
+
+    @Test
+    void emptyRawFieldKeepsAColumnNamedMessage() {
+        ValidateAgainstRegistry<SourceRecord> noRaw = configured(Map.of(ValidateAgainstRegistry.RAW_FIELD, ""));
+
+        SourceRecord result = noRaw.apply(record(TOPIC, order("A1", "02", null, ITEM)));
+
+        assertEquals(TOPIC, result.topic());
+        assertEquals(RAW, ((Struct) result.value()).getString("message"));
+    }
+
+    @Test
+    void nonStructValuesAreForwardedUnvalidated() {
+        SourceRecord record = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null,
+                                               Map.of("orderId", "A1"));
+
+        assertSame(record, transform.apply(record));
+    }
+
+    @Test
+    void tombstonesAreForwarded() {
+        SourceRecord record = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null, null);
+
+        assertSame(record, transform.apply(record));
+    }
+
+    @Test
     void registryErrorFailsTheRecordInsteadOfRoutingToDlq() {
         SourceRecord record = record("unknown.topic", order("A1", "02", null, ITEM));
 
@@ -149,11 +237,20 @@ class ValidateAgainstRegistryTest {
     }
 
     private ValidateAgainstRegistry<SourceRecord> withDlqTopic(String dlqTopic) {
-        ValidateAgainstRegistry<SourceRecord> explicit = new ValidateAgainstRegistry<>(registry);
-        explicit.configure(Map.of(
-            ValidateAgainstRegistry.SCHEMA_REGISTRY_URL, "mock://unused",
-            ValidateAgainstRegistry.DLQ_TOPIC, dlqTopic));
-        return explicit;
+        return configured(Map.of(ValidateAgainstRegistry.DLQ_TOPIC, dlqTopic));
+    }
+
+    private ValidateAgainstRegistry<SourceRecord> configured(Map<String, String> props) {
+        Map<String, String> all = new java.util.HashMap<>(props);
+        all.put(ValidateAgainstRegistry.SCHEMA_REGISTRY_URL, "mock://unused");
+        ValidateAgainstRegistry<SourceRecord> configured = new ValidateAgainstRegistry<>(registry);
+        configured.configure(all);
+        return configured;
+    }
+
+    private static String header(SourceRecord record, String name) {
+        var header = record.headers().lastWithName(name);
+        return header == null ? null : String.valueOf(header.value());
     }
 
     private static Struct assertDlq(SourceRecord result) {
