@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, to catch vulnerabilities disclosed after the last change
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -17,3 +23,31 @@ jobs:
           cache: maven
       - name: Build and test
         run: mvn -B verify
+
+  snyk:
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Skip without token
+        if: env.SNYK_TOKEN == ''
+        run: echo "::warning::SNYK_TOKEN secret is not available, Snyk scan skipped"
+
+      - name: Install Snyk CLI
+        if: env.SNYK_TOKEN != ''
+        run: npm install --global snyk
+
+      - name: Snyk open source scan
+        if: env.SNYK_TOKEN != ''
+        run: snyk test --severity-threshold=high
+
+      - name: Snyk monitor
+        if: env.SNYK_TOKEN != '' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: snyk monitor --project-name=kafka-connect-registry-validation-smt
