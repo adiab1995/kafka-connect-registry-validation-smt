@@ -6,7 +6,7 @@
 
   <groupId>com.pluxee.connect</groupId>
   <artifactId>kafka-connect-registry-validation-smt</artifactId>
-  <version>0.3.0</version>
+  <version>1.0.0</version>
   <packaging>jar</packaging>
 
   <name>Kafka Connect Registry Validation SMT</name>

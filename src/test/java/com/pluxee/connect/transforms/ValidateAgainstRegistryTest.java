@@ -7,12 +7,14 @@ import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.header.ConnectHeaders;
+import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -26,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ValidateAgainstRegistryTest {
 
     private static final String TOPIC = "dev.orders";
+    private static final String DLQ = TOPIC + ".dlq";
     private static final String RAW = "{\"raw\":\"line\"}";
 
     private static final Schema ITEM = SchemaBuilder.struct().optional()
@@ -47,11 +50,7 @@ class ValidateAgainstRegistryTest {
             Objects.requireNonNull(getClass().getResourceAsStream("/order-schema.json")).readAllBytes(),
             StandardCharsets.UTF_8);
         registry.register(TOPIC + "-value", new JsonSchema(schema));
-
-        transform = new ValidateAgainstRegistry<>(registry);
-        transform.configure(Map.of(
-            ValidateAgainstRegistry.SCHEMA_REGISTRY_URL, "mock://unused",
-            ValidateAgainstRegistry.SOURCE, "order"));
+        transform = configured(Map.of());
     }
 
     @AfterEach
@@ -60,173 +59,87 @@ class ValidateAgainstRegistryTest {
     }
 
     @Test
-    void validRecordKeepsTopicAndDropsRawField() {
-        SourceRecord result = transform.apply(record(TOPIC, order("A1", "02", List.of(item("SKU-1", "1.50")), ITEM)));
-
-        assertEquals(TOPIC, result.topic());
-        Struct value = (Struct) result.value();
-        assertNull(value.schema().field("message"));
-        assertEquals("A1", value.getString("orderId"));
-    }
-
-    @Test
-    void missingRequiredFieldGoesToDlq() {
-        Schema schema = SchemaBuilder.struct()
-            .field("message", Schema.STRING_SCHEMA)
-            .field("productCode", Schema.OPTIONAL_STRING_SCHEMA)
-            .build();
-        Struct value = new Struct(schema).put("message", RAW).put("productCode", "02");
-
-        Struct dlq = assertDlq(transform.apply(record(TOPIC, value)));
-
-        assertTrue(dlq.getString("error").contains("orderId"), dlq.getString("error"));
-    }
-
-    @Test
-    void patternViolationGoesToDlq() {
-        Struct dlq = assertDlq(transform.apply(record(TOPIC, order("A1", "002", null, ITEM))));
-
-        assertTrue(dlq.getString("error").contains("productCode"), dlq.getString("error"));
-    }
-
-    @Test
-    void nestedTypeViolationGoesToDlq() {
-        Struct item = new Struct(ITEM_NUMERIC_AMOUNT).put("sku", "SKU-1").put("amount", 1.5);
-
-        Struct dlq = assertDlq(transform.apply(record(TOPIC, order("A1", "02", List.of(item), ITEM_NUMERIC_AMOUNT))));
-
-        assertTrue(dlq.getString("error").contains("items/0/amount"), dlq.getString("error"));
-    }
-
-    @Test
-    void nestedRequiredViolationGoesToDlq() {
-        Struct dlq = assertDlq(transform.apply(record(TOPIC, order("A1", "02", List.of(item(null, "1.50")), ITEM))));
-
-        assertTrue(dlq.getString("error").contains("items/0"), dlq.getString("error"));
-    }
-
-    @Test
-    void dlqRecordCarriesRawLineAndHeaders() {
-        Struct dlq = assertDlq(transform.apply(record(TOPIC, order("A1", "002", null, ITEM))));
-
-        assertEquals(RAW, dlq.getString("message"));
-        assertEquals("order", dlq.getString("source"));
-        assertEquals("orders.zip", dlq.getString("fileName"));
-        assertEquals(42, dlq.getInt32("lineNumber"));
-    }
-
-    @Test
-    void recordsAlreadyOnDlqTopicAreUntouched() {
-        SourceRecord record = record(TOPIC + ".dlq", order("A1", "002", null, ITEM));
+    void validRecordIsForwardedUnchanged() {
+        SourceRecord record = record(TOPIC, order("A1", "02", List.of(item("SKU-1", "1.50")), ITEM));
 
         assertSame(record, transform.apply(record));
     }
 
     @Test
-    void explicitDlqTopicReceivesInvalidRecords() {
-        ValidateAgainstRegistry<SourceRecord> explicit = withDlqTopic("dev.errors");
+    void invalidRecordIsForwardedUnchangedToDlqWithErrorHeaders() {
+        SourceRecord record = record(TOPIC, order("A1", "002", null, ITEM));
 
-        SourceRecord result = explicit.apply(record(TOPIC, order("A1", "002", null, ITEM)));
+        SourceRecord result = transform.apply(record);
 
-        assertEquals("dev.errors", result.topic());
-        assertEquals(ValidateAgainstRegistry.DLQ_SCHEMA, result.valueSchema());
-        assertEquals(TOPIC, explicit.apply(record(TOPIC, order("A1", "02", null, ITEM))).topic());
-    }
-
-    @Test
-    void recordsAlreadyOnExplicitDlqTopicAreUntouched() {
-        ValidateAgainstRegistry<SourceRecord> explicit = withDlqTopic("dev.errors");
-        SourceRecord record = record("dev.errors", order("A1", "002", null, ITEM));
-
-        assertSame(record, explicit.apply(record));
-    }
-
-    @Test
-    void envelopeDlqRecordCarriesErrorHeaders() {
-        SourceRecord result = transform.apply(record(TOPIC, order("A1", "002", null, ITEM)));
-
-        assertTrue(header(result, "dlq.error.message").contains("productCode"));
-        assertEquals(TOPIC + "-value", header(result, "dlq.error.subject"));
-        assertEquals(TOPIC, header(result, "dlq.original.topic"));
+        assertEquals(DLQ, result.topic());
+        assertSame(record.key(), result.key());
+        assertSame(record.value(), result.value());
+        assertEquals(record.valueSchema(), result.valueSchema());
+        assertEquals(record.timestamp(), result.timestamp());
         assertEquals("42", header(result, "connect.file.line.number"));
+        assertTrue(header(result, ValidateAgainstRegistry.ERROR_MESSAGE_HEADER).contains("productCode"));
+        assertEquals(TOPIC + "-value", header(result, ValidateAgainstRegistry.ERROR_SUBJECT_HEADER));
+        assertEquals(TOPIC, header(result, ValidateAgainstRegistry.ORIGINAL_TOPIC_HEADER));
     }
 
     @Test
-    void originalModeKeepsRejectedValueAndPutsErrorInHeaders() {
-        ValidateAgainstRegistry<SourceRecord> original = configured(Map.of(
-            ValidateAgainstRegistry.DLQ_TOPIC, "dev.errors",
-            ValidateAgainstRegistry.DLQ_VALUE_MODE, "original"));
-        Struct value = order("A1", "002", null, ITEM);
+    void missingRequiredField() {
+        Schema schema = SchemaBuilder.struct().field("productCode", Schema.OPTIONAL_STRING_SCHEMA).build();
 
-        SourceRecord result = original.apply(record(TOPIC, value));
+        String error = dlqError(transform.apply(record(TOPIC, new Struct(schema).put("productCode", "02"))));
 
-        assertEquals("dev.errors", result.topic());
-        assertSame(value, result.value());
-        assertEquals(value.schema(), result.valueSchema());
-        assertTrue(header(result, "dlq.error.message").contains("productCode"));
-        assertEquals(TOPIC, header(result, "dlq.original.topic"));
+        assertTrue(error.contains("orderId"), error);
+    }
+
+    @Test
+    void nestedTypeViolation() {
+        Struct item = new Struct(ITEM_NUMERIC_AMOUNT).put("sku", "SKU-1").put("amount", 1.5);
+
+        String error = dlqError(transform.apply(record(TOPIC, order("A1", "02", List.of(item), ITEM_NUMERIC_AMOUNT))));
+
+        assertTrue(error.contains("#/items/0/amount"), error);
+    }
+
+    @Test
+    void nestedRequiredViolation() {
+        String error = dlqError(transform.apply(record(TOPIC, order("A1", "02", List.of(item(null, "1.50")), ITEM))));
+
+        assertTrue(error.contains("#/items/0"), error);
     }
 
     @Test
     void errorHeadersDoNotLeakIntoTheIncomingRecord() {
-        SourceRecord incoming = record(TOPIC, order("A1", "002", null, ITEM));
+        SourceRecord record = record(TOPIC, order("A1", "002", null, ITEM));
 
-        transform.apply(incoming);
+        transform.apply(record);
 
-        assertNull(incoming.headers().lastWithName("dlq.error.message"));
+        assertNull(record.headers().lastWithName(ValidateAgainstRegistry.ERROR_MESSAGE_HEADER));
     }
 
     @Test
-    void sourcePositionHeadersAreAddedToDlqRecords() {
-        ValidateAgainstRegistry<SourceRecord> withPosition = configured(Map.of(
-            ValidateAgainstRegistry.SOURCE_POSITION_HEADERS, "true"));
-        Struct value = order("A1", "002", null, ITEM);
-        SourceRecord record = new SourceRecord(Map.of("table", "orders"), Map.of("incrementing", 7L),
-                                               TOPIC, null, null, null, value.schema(), value);
+    void explicitDlqTopic() {
+        ValidateAgainstRegistry<SourceRecord> explicit = configured(Map.of(ValidateAgainstRegistry.DLQ_TOPIC, "dev.errors"));
 
-        SourceRecord result = withPosition.apply(record);
-
-        assertEquals("{\"table\":\"orders\"}", header(result, "connect.source.partition"));
-        assertEquals("{\"incrementing\":7}", header(result, "connect.source.offset"));
+        assertEquals("dev.errors", explicit.apply(record(TOPIC, order("A1", "002", null, ITEM))).topic());
     }
 
     @Test
-    void envelopeWithoutRawFieldStoresRecordAsJson() {
-        ValidateAgainstRegistry<SourceRecord> noRaw = configured(Map.of(ValidateAgainstRegistry.RAW_FIELD, ""));
-        Schema schema = SchemaBuilder.struct()
-            .field("orderId", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("productCode", Schema.OPTIONAL_STRING_SCHEMA)
-            .build();
-        Struct value = new Struct(schema).put("orderId", "A1").put("productCode", "002");
+    void recordsAlreadyOnDlqTopicAreUntouched() {
+        SourceRecord onSuffix = record(DLQ, order("A1", "002", null, ITEM));
+        assertSame(onSuffix, transform.apply(onSuffix));
 
-        Struct dlq = assertDlq(noRaw.apply(record(TOPIC, value)));
-
-        assertEquals("{\"orderId\":\"A1\",\"productCode\":\"002\"}", dlq.getString("message"));
+        ValidateAgainstRegistry<SourceRecord> explicit = configured(Map.of(ValidateAgainstRegistry.DLQ_TOPIC, "dev.errors"));
+        SourceRecord onExplicit = record("dev.errors", order("A1", "002", null, ITEM));
+        assertSame(onExplicit, explicit.apply(onExplicit));
     }
 
     @Test
-    void emptyRawFieldKeepsAColumnNamedMessage() {
-        ValidateAgainstRegistry<SourceRecord> noRaw = configured(Map.of(ValidateAgainstRegistry.RAW_FIELD, ""));
+    void nonStructValuesAndTombstonesAreForwarded() {
+        SourceRecord map = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null, Map.of("orderId", "A1"));
+        SourceRecord tombstone = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null, null);
 
-        SourceRecord result = noRaw.apply(record(TOPIC, order("A1", "02", null, ITEM)));
-
-        assertEquals(TOPIC, result.topic());
-        assertEquals(RAW, ((Struct) result.value()).getString("message"));
-    }
-
-    @Test
-    void nonStructValuesAreForwardedUnvalidated() {
-        SourceRecord record = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null,
-                                               Map.of("orderId", "A1"));
-
-        assertSame(record, transform.apply(record));
-    }
-
-    @Test
-    void tombstonesAreForwarded() {
-        SourceRecord record = new SourceRecord(Map.of(), Map.of(), TOPIC, null, null, null, null, null);
-
-        assertSame(record, transform.apply(record));
+        assertSame(map, transform.apply(map));
+        assertSame(tombstone, transform.apply(tombstone));
     }
 
     @Test
@@ -236,27 +149,22 @@ class ValidateAgainstRegistryTest {
         assertThrows(ConnectException.class, () -> transform.apply(record));
     }
 
-    private ValidateAgainstRegistry<SourceRecord> withDlqTopic(String dlqTopic) {
-        return configured(Map.of(ValidateAgainstRegistry.DLQ_TOPIC, dlqTopic));
-    }
-
     private ValidateAgainstRegistry<SourceRecord> configured(Map<String, String> props) {
-        Map<String, String> all = new java.util.HashMap<>(props);
+        Map<String, String> all = new HashMap<>(props);
         all.put(ValidateAgainstRegistry.SCHEMA_REGISTRY_URL, "mock://unused");
         ValidateAgainstRegistry<SourceRecord> configured = new ValidateAgainstRegistry<>(registry);
         configured.configure(all);
         return configured;
     }
 
-    private static String header(SourceRecord record, String name) {
-        var header = record.headers().lastWithName(name);
-        return header == null ? null : String.valueOf(header.value());
+    private static String dlqError(SourceRecord result) {
+        assertEquals(DLQ, result.topic());
+        return header(result, ValidateAgainstRegistry.ERROR_MESSAGE_HEADER);
     }
 
-    private static Struct assertDlq(SourceRecord result) {
-        assertEquals(TOPIC + ".dlq", result.topic());
-        assertEquals(ValidateAgainstRegistry.DLQ_SCHEMA, result.valueSchema());
-        return (Struct) result.value();
+    private static String header(SourceRecord record, String name) {
+        Header header = record.headers().lastWithName(name);
+        return header == null ? null : String.valueOf(header.value());
     }
 
     private static Struct item(String sku, String amount) {
@@ -281,6 +189,7 @@ class ValidateAgainstRegistryTest {
         ConnectHeaders headers = new ConnectHeaders();
         headers.addString("connect.file.name", "orders.zip");
         headers.addString("connect.file.line.number", "42");
-        return new SourceRecord(Map.of(), Map.of(), topic, null, null, null, value.schema(), value, null, headers);
+        return new SourceRecord(Map.of(), Map.of(), topic, null, Schema.STRING_SCHEMA, "key-1",
+                                value.schema(), value, 1_700_000_000_000L, headers);
     }
 }
