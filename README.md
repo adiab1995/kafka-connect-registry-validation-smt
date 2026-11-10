@@ -33,11 +33,28 @@ Other behaviours:
   with `dlq.topic.suffix`), so an upstream step can write to the same dead letter topic.
 - Values that are not a `Struct` (schemaless maps, strings) are forwarded unvalidated, with a warning logged once per
   topic. Tombstones are forwarded.
-- Schema Registry errors fail the record instead of sending it to the dead letter topic.
-- Schemas are cached and refreshed every `schema.cache.ttl.ms`.
+- Schemas are loaded with their **references**, so `$ref` to other subjects resolve. Only JSON Schema subjects are
+  supported: an Avro or Protobuf subject fails the record with an explicit error.
+- Schemas are cached and refreshed every `schema.cache.ttl.ms`. **If a refresh fails** (Schema Registry outage), the
+  previous schema keeps being used. If no schema was ever loaded, the record fails with a retriable error: set
+  `errors.retry.timeout` on the connector so Connect retries instead of dropping it. A subject that does not exist
+  fails the record without retry.
+- Error messages carry the path of the invalid field. They are computed without any network access.
 
-Since invalid records do not match the business schema, the subject of the dead letter topic must accept any object,
-e.g. `{"type": "object"}`.
+### The rerouted record goes through the converter
+
+An SMT runs **before** the converter: the rejected record is serialized by the connector's `value.converter` like any
+other record. Two consequences, both silent with `errors.tolerance=all`:
+
+- **The dead letter subject must exist and accept rejected records**, e.g. `{"type": "object"}`, otherwise rejected
+  records are dropped by the converter. When `dlq.topic` is set, the SMT checks that `<dlq.topic>-value` exists at
+  startup and **fails the connector** otherwise (`dlq.subject.check`).
+- **Set `value.converter.latest.compatibility.strict=false`**. With the default `true`, the converter also checks that
+  the latest registered schema is backward compatible with the schema Connect generates, and can drop a record the SMT
+  accepted.
+
+The SMT converts records to JSON like the converter: pass it the same conversion settings with the `json.data.`
+prefix (e.g. `value.converter.decimal.format=NUMERIC` → `transforms.validate.json.data.decimal.format=NUMERIC`).
 
 ## Installation
 
@@ -45,7 +62,7 @@ The SMT relies on the classes of the Confluent JSON Schema converter. Copy the j
 `kafka-connect-json-schema-converter` plugin**, so both share the same plugin class loader:
 
 ```dockerfile
-ADD https://github.com/adiab1995/kafka-connect-registry-validation-smt/releases/download/v1.0.0/kafka-connect-registry-validation-smt-1.0.0.jar \
+ADD https://github.com/adiab1995/kafka-connect-registry-validation-smt/releases/download/v1.1.0/kafka-connect-registry-validation-smt-1.1.0.jar \
     /usr/share/confluent-hub-components/confluentinc-kafka-connect-json-schema-converter/lib/
 ```
 
@@ -60,7 +77,10 @@ Built and tested against Confluent Platform 7.9.2 (Apache Kafka 3.9), Java 17.
 | `subject` | `<topic>-value` | Subject to validate against |
 | `dlq.topic` | — | Dead letter topic. Overrides `dlq.topic.suffix` when set |
 | `dlq.topic.suffix` | `.dlq` | Suffix appended to the record topic when `dlq.topic` is not set |
-| `schema.cache.ttl.ms` | `300000` | Schema cache duration |
+| `dlq.subject.check` | `true` | With `dlq.topic`, fail at startup if `<dlq.topic>-value` does not exist |
+| `strip.fields` | — | Top-level fields removed from valid records before validation and production (e.g. a raw `message` field). Records sent to the dead letter topic keep them |
+| `schema.cache.ttl.ms` | `300000` | Schema cache duration. The cached schema is kept if a refresh fails |
+| `json.data.*` | — | Connect to JSON conversion settings, same as the converter's (e.g. `json.data.decimal.format`) |
 
 Place the SMT **last** in the transform chain, after any SMT changing the topic, since the topic selects the subject.
 
@@ -93,15 +113,23 @@ invalid JSON lines itself to the same dead letter topic with the same error head
 "transforms.validate.schema.registry.url": "https://schema-registry:8081",
 "transforms.validate.basic.auth.user.info": "${file:/mnt/secrets/sr.properties:basic.auth.user.info}",
 "transforms.validate.dlq.topic": "dev.orders.rejected",
+"transforms.validate.strip.fields": "message",
 
 "value.converter": "io.confluent.connect.json.JsonSchemaConverter",
 "value.converter.auto.register.schemas": "false",
 "value.converter.use.latest.version": "true",
-"value.converter.json.fail.invalid.schema": "true"
+"value.converter.latest.compatibility.strict": "false",
+"value.converter.json.fail.invalid.schema": "true",
+
+"errors.tolerance": "all",
+"errors.retry.timeout": "300000"
 ```
 
 Use the same value for `filters.ToErrorTopic.value` and `transforms.validate.dlq.topic`, so both paths land on one
 dead letter topic and the SMT skips the records FilePulse already rerouted.
+
+`JSONFilter` with `merge=true` keeps the raw `message` field in the record. `strip.fields=message` removes it from valid
+records (required if the business schema has `additionalProperties: false`), while rejected records keep it.
 
 ## Build
 
@@ -115,8 +143,8 @@ Push a tag `vX.Y.Z`: the release workflow sets the version from the tag, builds,
 GitHub release.
 
 ```shell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 ## License

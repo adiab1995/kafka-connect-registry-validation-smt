@@ -6,7 +6,7 @@
 
   <groupId>com.pluxee.connect</groupId>
   <artifactId>kafka-connect-registry-validation-smt</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
   <packaging>jar</packaging>
 
   <name>Kafka Connect Registry Validation SMT</name>
@@ -72,6 +72,10 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.2</version>
+        <configuration>
+          <!-- Block network access: Connect workers often have none, so nothing may depend on it -->
+          <argLine>-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=9 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=9 -Dhttp.nonProxyHosts=</argLine>
+        </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
